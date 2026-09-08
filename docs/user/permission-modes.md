@@ -20,12 +20,18 @@ not prevent the agent from asking questions about the task.
 
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
 **Auto** uses automatic review on Codex, Claude, and Cursor; providers without an equivalent,
-including OpenCode and Antigravity, fall back to asking.
+including OpenCode and Antigravity, fall back to asking. Pi automatically permits its built-in
+read, search, edit, and write tools from a fixed allowlist and still asks before shell tools and
+unknown custom tools.
 
-For Grok, **Always allow this session** remembers the matching command or tool input. Other
+For Grok and Pi, **Always allow this session** remembers the matching command or tool input. Other
 actions still require approval.
 
 Antigravity can still send native approval requests in **Full access**. It only offers remembered
 approvals for actions that support them.
+
+Pi uses a T3-owned extension to intercept effectful Pi tool calls before execution and route them
+through the same inline approval controls. Pi approvals are policy controls, not an
+operating-system sandbox.
 
 See the [provider guides](./install.md#providers) for setup and provider-specific limits.

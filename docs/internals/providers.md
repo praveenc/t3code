@@ -57,6 +57,29 @@ run before the prompt. They reject profiles with such configuration before launc
 instructions and tool denial do not create a native sandbox.
 See [helper constraints](../../apps/server/src/textGeneration/AntigravityTextGeneration.ts).
 
+## Pi permission bridge
+
+T3 launches the pinned `pi-acp` runtime with a mandatory T3-owned Pi extension. The server writes
+the bundled extension source below the server state directory and passes its path to Pi through a
+one-shot argument file. A reviewed patch to `pi-acp` 0.0.33 reads and removes that file, then starts
+Pi with `--extension <path>`. Provider settings cannot remove or replace this argument. A configured
+custom `pi-acp` binary must include the same T3 patch; an unpatched 0.0.33 binary ignores the
+one-shot argument file and is not supported for Pi chat sessions.
+
+The extension intercepts Pi `tool_call` events before effectful tools execute. Read-only built-ins
+continue directly. Other tools call Pi RPC `ctx.ui.select`, which `pi-acp` translates into ACP
+`session/request_permission`. The reviewed bridge patch maps the extension's exact T3-owned labels
+to ACP allow-once, allow-always, and reject-once options. The Pi adapter normalizes allow-always to
+session-only T3 state, so it never creates a persistent Pi rule. Session approval is kept in adapter
+memory for the matching tool title and detail, ends with the provider session, and does not change
+other operations. Auto-accept edits approves Pi edit and write calls; Full access selects the ACP
+allow option without opening a client approval.
+
+This bridge is an application policy boundary, not an OS sandbox. A custom Pi binary must still
+honor Pi extension hooks for T3 runtime modes to govern tool execution.
+See the [Pi driver](../../apps/server/src/provider/Drivers/PiDriver.ts) and
+[Pi ACP support](../../apps/server/src/provider/acp/PiAcpSupport.ts).
+
 ## Provider updates run only through the owning installer
 
 A one-click update is offered only when the resolved executable's path proves which installer owns
