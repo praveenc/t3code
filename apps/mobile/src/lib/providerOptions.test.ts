@@ -49,6 +49,34 @@ describe("mobile provider options", () => {
     expect(applyProviderOptionSelection(descriptors, { id: "unknown", value: "high" })).toBeNull();
   });
 
+  it("updates Pi thinking levels through the generic descriptor path", () => {
+    const descriptors = resolveProviderOptionDescriptors({
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "thinkingLevel",
+            label: "Thinking",
+            type: "select",
+            options: [
+              { id: "off", label: "Off" },
+              { id: "xhigh", label: "Extra High", isDefault: true },
+            ],
+            currentValue: "xhigh",
+          },
+        ],
+      },
+      selections: undefined,
+    });
+
+    expect(
+      applyProviderOptionSelection(descriptors, { id: "thinkingLevel", value: "off" }),
+    ).toEqual([{ id: "thinkingLevel", value: "off" }]);
+    // Levels the descriptor doesn't advertise are rejected, not stored.
+    expect(
+      applyProviderOptionSelection(descriptors, { id: "thinkingLevel", value: "ultra" }),
+    ).toBeNull();
+  });
+
   it("updates generic boolean options", () => {
     const descriptors = resolveProviderOptionDescriptors({
       capabilities: {

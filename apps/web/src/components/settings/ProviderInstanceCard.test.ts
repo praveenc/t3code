@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 
 import { deriveProviderModelsForDisplay, ProviderInstanceCard } from "./ProviderInstanceCard";
+import { DRIVER_OPTION_BY_VALUE } from "./providerDriverMeta";
 
 describe("deriveProviderModelsForDisplay", () => {
   it("uses current config custom models instead of stale live custom rows", () => {
@@ -121,6 +122,48 @@ describe("deriveProviderModelsForDisplay", () => {
     expect(markup).toContain("blur-[2px]");
     expect(markup).not.toContain("developer@example.com");
   });
+  it("renders Pi limitations without hiding its authenticated status", () => {
+    const instanceId = ProviderInstanceId.make("piAgent");
+    const driver = ProviderDriverKind.make("piAgent");
+    const liveProvider: ServerProvider = {
+      instanceId,
+      driver,
+      enabled: true,
+      installed: true,
+      version: "0.85.1",
+      status: "ready",
+      auth: { status: "authenticated", label: "Anthropic" },
+      checkedAt: "2026-09-07T12:00:00.000Z",
+      models: [],
+      slashCommands: [],
+      skills: [],
+    };
+    const driverOption = DRIVER_OPTION_BY_VALUE[driver];
+    expect(driverOption).toBeDefined();
+
+    const markup = renderToStaticMarkup(
+      createElement(ProviderInstanceCard, {
+        instanceId,
+        instance: { driver, enabled: true },
+        driverOption: driverOption!,
+        liveProvider,
+        mode: "editor",
+        onUpdate: () => undefined,
+        hiddenModels: [],
+        favoriteModels: [],
+        modelOrder: [],
+        onHiddenModelsChange: () => undefined,
+        onFavoriteModelsChange: () => undefined,
+        onModelOrderChange: () => undefined,
+      }),
+    );
+
+    expect(markup).toContain("Authenticated");
+    expect(markup).toContain("Current limitations");
+    expect(markup).toContain("per-thread MCP server");
+    expect(markup).toContain("token or context-window usage");
+  });
+
   it("surfaces a failed probe message in both the list row and the editor", () => {
     const instanceId = ProviderInstanceId.make("codex_work");
     const driver = ProviderDriverKind.make("codex");

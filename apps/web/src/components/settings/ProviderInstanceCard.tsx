@@ -869,6 +869,16 @@ export function ProviderInstanceCard({
             }
           />
         )}
+        {driverOption?.limitations ? (
+          <div className="px-3 py-3 sm:px-4">
+            <p className="text-xs font-medium text-foreground">Current limitations</p>
+            <ul className="mt-1 list-disc space-y-1 pl-4 text-xs text-muted-foreground">
+              {driverOption.limitations.map((limitation) => (
+                <li key={limitation}>{limitation}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </SettingsSection>
 
       <SettingsSection

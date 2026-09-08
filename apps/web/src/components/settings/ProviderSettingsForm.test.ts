@@ -70,6 +70,24 @@ describe("ProviderSettingsForm helpers", () => {
     ]);
   });
 
+  it("shows Pi ACP and agent binary paths", () => {
+    const pi = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("piAgent")];
+    expect(pi).toBeDefined();
+    expect(pi).toMatchObject({
+      label: "Pi Agent",
+      badgeLabel: "Early Access",
+      limitations: [
+        expect.stringContaining("MCP"),
+        expect.stringContaining("context-window usage"),
+      ],
+    });
+
+    expect(deriveProviderSettingsFields(pi!).map((field) => field.key)).toEqual([
+      "binaryPath",
+      "piBinaryPath",
+    ]);
+  });
+
   it("preserves unknown config keys while omitting empty configurable fields", () => {
     const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
     expect(opencode).toBeDefined();

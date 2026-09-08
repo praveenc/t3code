@@ -14,7 +14,7 @@ import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hook
 import { cn } from "../../lib/utils";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { Button } from "../ui/button";
-import { ACPRegistryIcon, Gemini, GithubCopilotIcon, PiAgentIcon, type Icon } from "../Icons";
+import { ACPRegistryIcon, Gemini, GithubCopilotIcon, type Icon } from "../Icons";
 import { Dialog } from "../ui/dialog";
 import { Badge } from "../ui/badge";
 import { Input } from "../ui/input";
@@ -85,11 +85,6 @@ const COMING_SOON_DRIVER_OPTIONS: readonly ComingSoonDriverOption[] = [
     value: ProviderDriverKind.make("acpRegistry"),
     label: "ACP Registry",
     icon: ACPRegistryIcon,
-  },
-  {
-    value: ProviderDriverKind.make("piAgent"),
-    label: "Pi Agent",
-    icon: PiAgentIcon,
   },
 ];
 
@@ -381,6 +376,17 @@ export function AddProviderInstanceDialog({
               Optional marker shown in the picker.
             </span>
           </div>
+
+          {driverOption.limitations && wizardStep === 2 ? (
+            <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2">
+              <p className="text-xs font-medium text-foreground">Current limitations</p>
+              <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] text-muted-foreground">
+                {driverOption.limitations.map((limitation) => (
+                  <li key={limitation}>{limitation}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
 
           {driverSettingsFields.length > 0 ? (
             <div className={cn("grid gap-4", wizardStep !== 2 && "hidden")}>
