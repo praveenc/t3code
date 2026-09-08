@@ -164,7 +164,11 @@ describe("AcpSessionRuntime", () => {
           if (event._tag === "ToolCallUpdated" && event.toolCall.status === "inProgress") {
             return Deferred.succeed(toolStarted, undefined);
           }
-          if (event._tag === "ThoughtDelta" && event.text === "native-cancel-received") {
+          if (
+            event._tag === "ContentDelta" &&
+            event.streamKind === "reasoning_text" &&
+            event.text === "native-cancel-received"
+          ) {
             return Deferred.succeed(cancelReceived, undefined);
           }
           return Effect.void;
@@ -242,7 +246,7 @@ describe("AcpSessionRuntime", () => {
           if (event._tag === "ToolCallUpdated") {
             return Deferred.succeed(toolStarted, undefined);
           }
-          if (event._tag === "ThoughtDelta") {
+          if (event._tag === "ContentDelta" && event.streamKind === "reasoning_text") {
             return Deferred.succeed(cancelReceived, undefined);
           }
           return Effect.void;

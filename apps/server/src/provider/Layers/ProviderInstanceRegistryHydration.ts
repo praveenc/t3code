@@ -13,12 +13,12 @@
  *      yet to an explicit `providerInstances` entry.
  *
  * This module bridges (2) into (1) and wires the resulting map into a
- * mutable registry. For every built-in driver whose id is not already
- * present in `providerInstances` (keyed on
+ * mutable registry. For every legacy provider settings entry whose id is not
+ * already present in `providerInstances` (keyed on
  * `defaultInstanceIdForDriver(driverKind)` — literally the driver kind as a
- * routing slug), we synthesize an envelope from the legacy field. The
- * registry decodes both flavours through the same `configSchema` and ends
- * up with one uniform `ProviderInstance` per entry.
+ * routing slug), we synthesize an envelope from the legacy field. Registered
+ * drivers decode that envelope through their `configSchema`; entries whose
+ * driver has not landed yet remain visible as unavailable snapshots.
  *
  * Explicit `providerInstances` entries always win — users can already
  * override the legacy `providers.<kind>` blob by authoring a
@@ -45,6 +45,7 @@ import {
   defaultInstanceIdForDriver,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
+  ProviderDriverKind,
   ServerSettings,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -62,9 +63,10 @@ import { ProviderInstanceRegistryMutableLayer } from "./ProviderInstanceRegistry
  *
  * Strategy:
  *   1. Copy all explicit `settings.providerInstances` entries verbatim.
- *   2. For each built-in driver whose `defaultInstanceIdForDriver(id)` key
- *      is *not* already in the explicit map, synthesize an entry from the
- *      matching legacy `settings.providers.<kind>` blob.
+ *   2. For each legacy `settings.providers.<kind>` entry whose default
+ *      instance id is *not* already in the explicit map, synthesize an
+ *      envelope from that settings blob. The runtime registry can preserve
+ *      the entry as unavailable until its driver is registered.
  *
  * The returned map is the input the registry consumes; pure & exported
  * separately so the hydration logic can be exercised by unit tests
@@ -75,27 +77,17 @@ export const deriveProviderInstanceConfigMap = (
 ): ProviderInstanceConfigMap => {
   const merged: Record<string, ProviderInstanceConfig> = { ...settings.providerInstances };
 
-  for (const driver of BUILT_IN_DRIVERS) {
-    const instanceId = defaultInstanceIdForDriver(driver.driverKind);
+  for (const [rawDriverKind, legacyConfig] of Object.entries(settings.providers)) {
+    const driverKind = ProviderDriverKind.make(rawDriverKind);
+    const instanceId = defaultInstanceIdForDriver(driverKind);
     if (instanceId in merged) {
       // Explicit `providerInstances` entry for this slot — user-authored
       // config always wins over the legacy mirror.
       continue;
     }
 
-    // Only built-in drivers have a legacy mirror; the registry's
-    // `providers` struct is keyed on the same literal slug as
-    // `driverKind`. Access is dynamic (the driver kind is a branded string),
-    // but it's constrained to `keyof settings.providers` by the union of
-    // built-in driver kinds.
-    const legacyKey = driver.driverKind as keyof ServerSettings["providers"];
-    const legacyConfig = settings.providers[legacyKey];
-    if (legacyConfig === undefined) {
-      continue;
-    }
-
     merged[instanceId] = {
-      driver: driver.driverKind,
+      driver: driverKind,
       config: legacyConfig,
     };
   }

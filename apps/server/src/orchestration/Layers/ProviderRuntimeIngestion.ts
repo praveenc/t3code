@@ -1575,9 +1575,15 @@ const make = Effect.gen(function* () {
             case "turn.aborted":
               return "interrupted";
             case "turn.completed":
-              return normalizeRuntimeTurnState(event.payload.state) === "failed"
-                ? "error"
-                : "ready";
+              switch (normalizeRuntimeTurnState(event.payload.state)) {
+                case "failed":
+                  return "error";
+                case "interrupted":
+                case "cancelled":
+                  return "interrupted";
+                case "completed":
+                  return "ready";
+              }
             case "session.started":
             case "thread.started":
               // Provider thread/session start notifications can arrive during an

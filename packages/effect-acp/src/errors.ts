@@ -90,11 +90,19 @@ export class AcpSpawnError extends Schema.TaggedError<AcpSpawnError>()("AcpSpawn
   }
 }
 
+export const AcpProcessDiagnostics = Schema.Struct({
+  stderr: Schema.String,
+  stderrTruncated: Schema.Boolean,
+  stderrInvalidUtf8: Schema.Boolean,
+});
+export type AcpProcessDiagnostics = typeof AcpProcessDiagnostics.Type;
+
 export class AcpProcessExitedError extends Schema.TaggedError<AcpProcessExitedError>()(
   "AcpProcessExitedError",
   {
     code: Schema.optional(Schema.Number),
     pid: Schema.optionalKey(Schema.Int),
+    diagnostics: Schema.optionalKey(AcpProcessDiagnostics),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

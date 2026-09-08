@@ -54,6 +54,29 @@ describe("effect-acp errors", () => {
     });
   });
 
+  it.effect("retains a typed ACP termination failure from the client transport", () => {
+    const processError = new AcpError.AcpProcessExitedError({
+      code: 17,
+      pid: 41,
+      diagnostics: {
+        stderr: "pi-acp failed to start pi",
+        stderrTruncated: false,
+        stderrInvalidUtf8: false,
+      },
+    });
+    const failure = new RpcClientError.RpcClientError({
+      reason: new RpcClientError.RpcClientDefect({
+        message: "ACP protocol terminated.",
+        cause: processError,
+      }),
+    });
+
+    return Effect.gen(function* () {
+      const error = yield* callRpc("initialize", Effect.fail(failure)).pipe(Effect.flip);
+      expect(error).toBe(processError);
+    });
+  });
+
   it.effect("preserves protocol request errors as request errors", () => {
     const failure = AcpSchema.Error.make({
       code: -32602,

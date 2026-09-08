@@ -15,6 +15,8 @@
  * a package's platform-specific siblings — `node-gyp-build` covers
  * `node-gyp-build-optional-packages`, `@yuuang/` covers every `ffi-rs-*` binding.
  */
+export const CLI_SPAWNED_RUNTIME_DEPENDENCIES = ["pi-acp"] as const;
+
 /**
  * External because Node actually loads them from disk at runtime.
  *
@@ -92,12 +94,18 @@ export function shouldBundleCliDependency(id: string): boolean {
   return !isExternalCliDependency(id);
 }
 
-/** Select direct dependency roots whose runtime closure belongs in the sidecar. */
+/** Select direct dependency roots that must remain on disk at runtime. */
 export function selectCliRuntimeExternalDependencies(
   dependencies: Readonly<Record<string, string>>,
 ): Record<string, string> {
   return Object.fromEntries(
-    Object.entries(dependencies).filter(([name]) => isRuntimeExternalCliDependency(name)),
+    Object.entries(dependencies).filter(
+      ([name]) =>
+        isRuntimeExternalCliDependency(name) ||
+        CLI_SPAWNED_RUNTIME_DEPENDENCIES.includes(
+          name as (typeof CLI_SPAWNED_RUNTIME_DEPENDENCIES)[number],
+        ),
+    ),
   );
 }
 

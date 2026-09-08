@@ -7,6 +7,8 @@ import {
   ClientSettingsPatch,
   ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
+  defaultEnabledForDriver,
+  PiSettings,
   resolveProviderInstanceEnabled,
   ServerSettings,
   ServerSettingsPatch,
@@ -19,6 +21,41 @@ const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
+const decodePiSettings = Schema.decodeUnknownSync(PiSettings);
+
+describe("PiSettings", () => {
+  it("defaults to an opt-in pi-acp instance", () => {
+    expect(decodePiSettings({})).toEqual({
+      enabled: false,
+      binaryPath: "pi-acp",
+      piBinaryPath: "pi",
+      customModels: [],
+    });
+  });
+
+  it("trims configured paths and validates provider patches", () => {
+    expect(
+      decodePiSettings({ binaryPath: "  /opt/bin/pi-acp  ", piBinaryPath: "  /opt/bin/pi  " }),
+    ).toMatchObject({
+      binaryPath: "/opt/bin/pi-acp",
+      piBinaryPath: "/opt/bin/pi",
+    });
+    expect(
+      decodeServerSettingsPatch({
+        providers: {
+          piAgent: { binaryPath: "  /opt/bin/pi-acp  ", piBinaryPath: "  /opt/bin/pi  " },
+        },
+      }),
+    ).toEqual({
+      providers: {
+        piAgent: { binaryPath: "/opt/bin/pi-acp", piBinaryPath: "/opt/bin/pi" },
+      },
+    });
+    expect(() =>
+      decodeServerSettingsPatch({ providers: { piAgent: { enabled: "yes" } } }),
+    ).toThrow();
+  });
+});
 
 describe("ServerSettings usage price overrides", () => {
   const prices = { inputCostPerMillionTokens: 2, outputCostPerMillionTokens: 8 };
@@ -543,9 +580,19 @@ describe("provider enabled defaults", () => {
     const decoded = decodeServerSettings({});
     expect(decoded.providers.codex.enabled).toBe(true);
     expect(decoded.providers.claudeAgent.enabled).toBe(true);
+    expect(decoded.providers.piAgent.enabled).toBe(false);
     expect(decoded.providers.cursor.enabled).toBe(false);
     expect(decoded.providers.grok.enabled).toBe(false);
     expect(decoded.providers.opencode.enabled).toBe(false);
+  });
+
+  it("derives per-driver defaults from the settings schemas", () => {
+    expect(defaultEnabledForDriver(ProviderDriverKind.make("codex"))).toBe(true);
+    expect(defaultEnabledForDriver(ProviderDriverKind.make("piAgent"))).toBe(false);
+    expect(defaultEnabledForDriver(ProviderDriverKind.make("cursor"))).toBe(false);
+    expect(defaultEnabledForDriver(ProviderDriverKind.make("grok"))).toBe(false);
+    // Unknown fork drivers stay enabled; their own build decides otherwise.
+    expect(defaultEnabledForDriver(ProviderDriverKind.make("ollama"))).toBe(true);
   });
 
   it("keeps Cursor enabled when an existing user explicitly opted in", () => {

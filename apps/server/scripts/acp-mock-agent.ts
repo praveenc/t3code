@@ -15,6 +15,9 @@ import type * as AcpSchema from "effect-acp/schema";
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
+const stderrText = process.env.T3_ACP_STDERR_TEXT;
+const stderrRepeat = Math.max(1, Number(process.env.T3_ACP_STDERR_REPEAT ?? "1") || 1);
+const exitAfterInitializeCode = Number(process.env.T3_ACP_EXIT_AFTER_INITIALIZE_CODE);
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
@@ -49,9 +52,22 @@ const emitStaleXAiPromptCompleteBeforeSecondHang =
 const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
+const emitMalformedPromptOutput = process.env.T3_ACP_EMIT_MALFORMED_PROMPT_OUTPUT === "1";
+const exitOnPrompt = process.env.T3_ACP_EXIT_ON_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
+const permissionRequestToolName = process.env.T3_ACP_PERMISSION_TOOL_NAME?.trim() || undefined;
+const permissionRequestKind = process.env.T3_ACP_PERMISSION_KIND?.trim() as
+  | AcpSchema.ToolKind
+  | undefined;
+const emitPiUserInput = process.env.T3_ACP_EMIT_PI_USER_INPUT === "1";
+const piUserInputMethod = process.env.T3_ACP_PI_USER_INPUT_METHOD === "editor" ? "editor" : "input";
+const emitPiThought = process.env.T3_ACP_EMIT_PI_THOUGHT === "1";
+const emitPiConfigUpdate = process.env.T3_ACP_EMIT_PI_CONFIG_UPDATE === "1";
+const emitPiToolEvents = process.env.T3_ACP_EMIT_PI_TOOL_EVENTS === "1";
+const emitPiRetry = process.env.T3_ACP_EMIT_PI_RETRY === "1";
+const emitLatePiUpdate = process.env.T3_ACP_EMIT_LATE_PI_UPDATE === "1";
 const initialGrokReasoningEffort =
   process.env.T3_ACP_INITIAL_GROK_REASONING_EFFORT?.trim() || undefined;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
@@ -112,6 +128,74 @@ process.once("SIGINT", () => {
 process.once("exit", (code) => {
   logExit(`exit:${code}`);
 });
+
+const PI_MODEL_CONFIG_ID = "model";
+const PI_THINKING_CONFIG_ID = "thought_level";
+const PI_AUTH_METHOD_ID = "pi_terminal_login";
+
+function emitPiCommands(sessionId: string): void {
+  if (process.env.T3_ACP_EMIT_PI_COMMANDS !== "1") return;
+  writeJsonRpcNotification("session/update", {
+    sessionId,
+    update: {
+      sessionUpdate: "available_commands_update",
+      availableCommands: [
+        {
+          name: "review",
+          description: "Review the current changes",
+          input: { hint: "[focus]" },
+        },
+        {
+          name: "skill:browser",
+          description: "Automate browser tasks",
+          _meta: {
+            path: "/tmp/pi-skills/browser/SKILL.md",
+            scope: "user",
+          },
+        },
+      ],
+    },
+  });
+}
+
+function piConfigOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
+  return [
+    {
+      id: PI_MODEL_CONFIG_ID,
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "anthropic/claude-sonnet-4-6",
+      options: [
+        { value: "anthropic/claude-sonnet-4-6", name: "anthropic/Claude Sonnet 4.6" },
+        { value: "openai/gpt-5.4", name: "openai/GPT-5.4" },
+      ],
+    },
+    {
+      id: PI_THINKING_CONFIG_ID,
+      name: "Thinking",
+      category: "thought_level",
+      type: "select",
+      currentValue: "high",
+      options: [
+        { value: "off", name: "Thinking: off" },
+        { value: "low", name: "Thinking: low" },
+        { value: "high", name: "Thinking: high" },
+        { value: "xhigh", name: "Thinking: xhigh" },
+      ],
+    },
+  ];
+}
+
+function piModelState(): AcpSchema.SessionModelState {
+  return {
+    currentModelId: "anthropic/claude-sonnet-4-6",
+    availableModels: [
+      { modelId: "anthropic/claude-sonnet-4-6", name: "anthropic/Claude Sonnet 4.6" },
+      { modelId: "openai/gpt-5.4", name: "openai/GPT-5.4" },
+    ],
+  };
+}
 
 function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
   if (antigravityProfile) {
@@ -391,6 +475,12 @@ const program = Effect.gen(function* () {
       }
       parameterizedModelPicker =
         request.clientCapabilities?._meta?.parameterizedModelPicker === true;
+      if (stderrText) {
+        process.stderr.write(stderrText.repeat(stderrRepeat));
+      }
+      if (Number.isFinite(exitAfterInitializeCode)) {
+        process.exit(exitAfterInitializeCode);
+      }
       if (antigravityProfile) {
         return {
           protocolVersion: 1,
@@ -402,6 +492,17 @@ const program = Effect.gen(function* () {
             promptCapabilities: { image: true, embeddedContext: true },
           },
           authMethods: [{ id: "oauth-personal", name: "Sign in with Google" }],
+        };
+      }
+      if (process.env.T3_ACP_PI_DISCOVERY === "1") {
+        return {
+          protocolVersion: 1,
+          agentCapabilities: { loadSession: true },
+          agentInfo: {
+            name: "pi-acp",
+            version: process.env.T3_ACP_AGENT_VERSION ?? "0.0.33",
+          },
+          authMethods: [{ id: PI_AUTH_METHOD_ID, name: "Launch Pi", type: "agent" as const }],
         };
       }
       return {
@@ -433,6 +534,21 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleCreateSession(() =>
     Effect.gen(function* () {
+      if (process.env.T3_ACP_PI_AUTH_REQUIRED === "1") {
+        return yield* Effect.fail(
+          AcpError.AcpRequestError.authRequired(
+            "Configure an API key or log in with an OAuth provider.",
+          ),
+        );
+      }
+      if (process.env.T3_ACP_PI_DISCOVERY === "1") {
+        queueMicrotask(() => emitPiCommands(sessionId));
+        return {
+          sessionId,
+          models: piModelState(),
+          configOptions: piConfigOptions(),
+        };
+      }
       if (antigravityProfile) {
         yield* publishAntigravityCommands(sessionId);
       }
@@ -507,11 +623,13 @@ const program = Effect.gen(function* () {
           },
         });
         yield* Effect.sleep(loadSessionDelayMs);
-        return {
-          modes: modeState(),
-          models: modelState(),
-          configOptions: configOptions(),
-        };
+        return process.env.T3_ACP_PI_DISCOVERY === "1"
+          ? { models: piModelState(), configOptions: piConfigOptions() }
+          : {
+              modes: modeState(),
+              models: modelState(),
+              configOptions: configOptions(),
+            };
       }
       if (emitLoadReplay) {
         emitLoadReplayNotifications(requestedSessionId);
@@ -523,11 +641,13 @@ const program = Effect.gen(function* () {
           content: { type: "text", text: "replay" },
         },
       });
-      return {
-        modes: modeState(),
-        models: modelState(),
-        configOptions: configOptions(),
-      };
+      return process.env.T3_ACP_PI_DISCOVERY === "1"
+        ? { models: piModelState(), configOptions: piConfigOptions() }
+        : {
+            modes: modeState(),
+            models: modelState(),
+            configOptions: configOptions(),
+          };
     }),
   );
 
@@ -570,6 +690,9 @@ const program = Effect.gen(function* () {
         currentModelId = request.value;
       }
       if (request.configId === "reasoning" && typeof request.value === "string") {
+        currentReasoning = request.value;
+      }
+      if (request.configId === PI_THINKING_CONFIG_ID && typeof request.value === "string") {
         currentReasoning = request.value;
       }
       if (request.configId === "context" && typeof request.value === "string") {
@@ -652,6 +775,17 @@ const program = Effect.gen(function* () {
 
       if (Number.isFinite(promptDelayMs) && promptDelayMs > 0) {
         yield* Effect.sleep(`${promptDelayMs} millis`);
+      }
+
+      if (emitMalformedPromptOutput) {
+        process.stdout.write("{malformed ACP output}\n");
+        return yield* Effect.never;
+      }
+
+      if (exitOnPrompt) {
+        return yield* Effect.sync(() => {
+          process.exit(19);
+        });
       }
 
       if (failPrompt) {
@@ -835,6 +969,112 @@ const program = Effect.gen(function* () {
         return yield* Effect.never;
       }
 
+      if (emitPiRetry) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Retrying (attempt 2/3, waiting 1s)..." },
+          },
+        });
+      }
+
+      if (emitPiToolEvents) {
+        const commandToolCallId = "pi-command-1";
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: commandToolCallId,
+            title: "printf hello",
+            kind: "execute",
+            status: "pending",
+            rawInput: { command: "printf hello" },
+            content: [{ type: "terminal", terminalId: commandToolCallId }],
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: commandToolCallId,
+            status: "in_progress",
+            _meta: {
+              terminal_output: { terminal_id: commandToolCallId, data: "hello" },
+            },
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: commandToolCallId,
+            status: "completed",
+            _meta: {
+              terminal_exit: { terminal_id: commandToolCallId, exit_code: 0, signal: null },
+            },
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: commandToolCallId,
+            status: "in_progress",
+            rawOutput: { stdout: "late status regression" },
+          },
+        });
+
+        const editToolCallId = "pi-edit-1";
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: editToolCallId,
+            title: "edit",
+            kind: "edit",
+            status: "in_progress",
+            rawInput: { path: "src/example.ts" },
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: editToolCallId,
+            status: "completed",
+            content: [
+              {
+                type: "diff",
+                path: "src/example.ts",
+                oldText: "const value = 1;",
+                newText: "const value = 2;",
+              },
+            ],
+          },
+        });
+      }
+
+      if (emitPiThought) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "checking the Pi implementation" },
+          },
+        });
+      }
+
+      if (emitPiConfigUpdate) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: piConfigOptions(),
+          },
+        });
+      }
+
       if (emitInterleavedAssistantToolCalls) {
         const toolCallId = "tool-call-1";
 
@@ -885,16 +1125,49 @@ const program = Effect.gen(function* () {
         return { stopReason: "end_turn" };
       }
 
+      if (emitPiUserInput) {
+        const response = yield* agent.client.extRequest("t3/pi/user_input", {
+          sessionId: requestedSessionId,
+          requestId: "pi-input-1",
+          method: piUserInputMethod,
+          title: "Pi needs input",
+          message: "What should Pi do next?",
+          placeholder: "Describe the next step",
+          prefill: "",
+        });
+        const value =
+          typeof response === "object" &&
+          response !== null &&
+          typeof Reflect.get(response, "value") === "string"
+            ? String(Reflect.get(response, "value"))
+            : "cancelled";
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `Pi input: ${value}` },
+          },
+        });
+        return { stopReason: value === "cancelled" ? "cancelled" : "end_turn" };
+      }
+
       if (emitToolCalls) {
         const toolCallId = "tool-call-1";
+        const extensionPermissionRequest = process.env.T3_ACP_EXTENSION_PERMISSION_REQUEST === "1";
 
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
           update: {
             sessionUpdate: "tool_call",
             toolCallId,
-            title: "Terminal",
-            kind: "execute",
+            title: process.env.T3_ACP_PERMISSION_TITLE ?? permissionRequestToolName ?? "Terminal",
+            kind:
+              permissionRequestKind ??
+              (permissionRequestToolName === "edit" || permissionRequestToolName === "write"
+                ? "edit"
+                : permissionRequestToolName === "read"
+                  ? "read"
+                  : "execute"),
             status: "pending",
             rawInput: {
               command: ["cat", "server/package.json"],
@@ -911,19 +1184,29 @@ const program = Effect.gen(function* () {
           },
         });
 
-        const permissionOptions: Array<AcpSchema.PermissionOption> = [
-          { optionId: permissionOptionIds.allowOnce, name: "Allow once", kind: "allow_once" },
-          ...(omitAllowAlways
-            ? []
-            : [
-                {
-                  optionId: permissionOptionIds.allowAlways,
-                  name: "Allow always",
-                  kind: "allow_always" as const,
-                },
-              ]),
-          { optionId: permissionOptionIds.rejectOnce, name: "Reject", kind: "reject_once" },
-        ];
+        const permissionOptions: Array<AcpSchema.PermissionOption> = extensionPermissionRequest
+          ? [
+              { optionId: "choice-0", name: "Allow once", kind: "allow_once" },
+              {
+                optionId: "choice-1",
+                name: "Allow for this session",
+                kind: "allow_always",
+              },
+              { optionId: "choice-2", name: "Reject", kind: "reject_once" },
+            ]
+          : [
+              { optionId: permissionOptionIds.allowOnce, name: "Allow once", kind: "allow_once" },
+              ...(omitAllowAlways
+                ? []
+                : [
+                    {
+                      optionId: permissionOptionIds.allowAlways,
+                      name: "Allow always",
+                      kind: "allow_always" as const,
+                    },
+                  ]),
+              { optionId: permissionOptionIds.rejectOnce, name: "Reject", kind: "reject_once" },
+            ];
 
         let cancelled = cancelledSessions.delete(requestedSessionId);
         for (let index = 0; index < permissionRequestCount; index++) {
@@ -933,26 +1216,49 @@ const program = Effect.gen(function* () {
               : "cat server/package.json";
           const permission = yield* agent.client.requestPermission({
             sessionId: requestedSessionId,
-            toolCall: {
-              toolCallId: index === 0 ? toolCallId : `${toolCallId}-${index + 1}`,
-              title: process.env.T3_ACP_PERMISSION_TITLE ?? `\`${command}\``,
-              kind: "execute",
-              status: "pending",
-              rawInput: {
-                variant: "Bash",
-                command,
-                description: index === 0 ? "Read package metadata" : "Read it again",
-              },
-              content: [
-                {
-                  type: "content",
-                  content: {
-                    type: "text",
-                    text: `Not in allowlist: ${command}`,
+            toolCall: extensionPermissionRequest
+              ? {
+                  toolCallId: `pi-ui-${index + 1}`,
+                  title:
+                    process.env.T3_ACP_PERMISSION_TITLE ??
+                    (permissionRequestToolName
+                      ? `Allow Pi to run ${permissionRequestToolName}?\n${command}`
+                      : `Allow Pi to run bash?\n${command}`),
+                  kind:
+                    permissionRequestToolName === "edit" || permissionRequestToolName === "write"
+                      ? "edit"
+                      : "other",
+                  status: "pending",
+                  rawInput: {
+                    method: "select",
+                    title:
+                      process.env.T3_ACP_PERMISSION_TITLE ??
+                      (permissionRequestToolName
+                        ? `Allow Pi to run ${permissionRequestToolName}?\n${command}`
+                        : `Allow Pi to run bash?\n${command}`),
+                    options: ["Allow once", "Allow for this session", "Reject"],
                   },
+                }
+              : {
+                  toolCallId: index === 0 ? toolCallId : `${toolCallId}-${index + 1}`,
+                  title: process.env.T3_ACP_PERMISSION_TITLE ?? `\`${command}\``,
+                  kind: "execute",
+                  status: "pending",
+                  rawInput: {
+                    variant: "Bash",
+                    command,
+                    description: index === 0 ? "Read package metadata" : "Read it again",
+                  },
+                  content: [
+                    {
+                      type: "content",
+                      content: {
+                        type: "text",
+                        text: `Not in allowlist: ${command}`,
+                      },
+                    },
+                  ],
                 },
-              ],
-            },
             options: permissionOptions,
           });
           cancelled =
@@ -1227,6 +1533,18 @@ const program = Effect.gen(function* () {
         },
       });
 
+      if (emitLatePiUpdate) {
+        queueMicrotask(() => {
+          writeJsonRpcNotification("session/update", {
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "late Pi update" },
+            },
+          });
+        });
+      }
+
       return { stopReason: "end_turn" };
     }),
   );
@@ -1352,11 +1670,30 @@ const program = Effect.gen(function* () {
               }
               const payload = event.payload;
               return Effect.sync(() => {
-                NodeFS.appendFileSync(
-                  requestLogPath,
-                  payload.endsWith("\n") ? payload : `${payload}\n`,
-                  "utf8",
-                );
+                // A single raw stdin chunk may frame multiple newline-delimited
+                // JSON-RPC messages. Enrich each line the peer can parse; append
+                // anything else verbatim so logging never throws and stays ndjson.
+                for (const line of payload.split("\n")) {
+                  const trimmed = line.trim();
+                  if (trimmed.length === 0) {
+                    continue;
+                  }
+                  let entry = trimmed;
+                  try {
+                    // @effect-diagnostics-next-line preferSchemaOverJson:off - test peer enriches captured JSON-RPC with process state.
+                    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+                    // @effect-diagnostics-next-line preferSchemaOverJson:off - test-only NDJSON fixture logging.
+                    entry = JSON.stringify({
+                      ...parsed,
+                      cwd: process.cwd(),
+                      piCommand: process.env.PI_ACP_PI_COMMAND,
+                      runtimeMode: process.env.T3_PI_RUNTIME_MODE,
+                    });
+                  } catch {
+                    entry = trimmed;
+                  }
+                  NodeFS.appendFileSync(requestLogPath, `${entry}\n`, "utf8");
+                }
               });
             },
           }

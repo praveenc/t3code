@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -22,6 +23,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
+import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import {
   collectSessionConfigOptionValues,
   decideToolCallUpdateEmission,
@@ -68,6 +70,15 @@ const defaultCancelTimeout = Duration.seconds(15);
 const maxStartupMetadataUpdates = 32;
 // Antigravity can emit an accepted 16 KiB Google authorization URL on stderr.
 const maxStderrChunkLength = 32_768;
+const defaultStderrMaxBytes = 64 * 1024;
+const stderrTruncatedMarker = "\n[truncated]";
+
+export const AcpStderrDiagnostic = Schema.Struct({
+  text: Schema.String,
+  truncated: Schema.Boolean,
+  invalidUtf8: Schema.Boolean,
+});
+export type AcpStderrDiagnostic = typeof AcpStderrDiagnostic.Type;
 
 export interface AcpSpawnInput {
   readonly command: string;
@@ -104,12 +115,22 @@ export interface AcpSessionRuntimeOptions {
   ) => EffectAcpSchema.SessionNotification;
   /** Receives bounded stderr chunks. Redact secrets before logging. A failure closes the runtime. */
   readonly onStderr?: (text: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+  /**
+   * Optional extension request that acknowledges provider-side cancellation
+   * after the active prompt and its tools have settled.
+   */
+  readonly cancelRequestMethod?: string;
+  readonly onCancelTimeout?: () => Effect.Effect<void, never>;
   readonly requestLogger?: (event: AcpSessionRequestLogEvent) => Effect.Effect<void, never>;
   readonly protocolLogging?: {
     readonly logIncoming?: boolean;
     readonly logOutgoing?: boolean;
     readonly logger?: (event: EffectAcpProtocol.AcpProtocolLogEvent) => Effect.Effect<void, never>;
   };
+  readonly stderrMaxBytes?: number;
+  readonly processDiagnosticLogger?: (
+    diagnostic: AcpStderrDiagnostic,
+  ) => Effect.Effect<void, never>;
 }
 
 export interface AcpSessionRequestLogEvent {
@@ -231,6 +252,10 @@ export class AcpSessionRuntime extends Context.Service<
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
     readonly getConfigOptions: Effect.Effect<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>;
+    /** Latest slash commands advertised by the active ACP session. */
+    readonly getAvailableCommands: Effect.Effect<ReadonlyArray<EffectAcpSchema.AvailableCommand>>;
+    /** Waits for the first slash-command catalog update. */
+    readonly awaitAvailableCommands: Effect.Effect<ReadonlyArray<EffectAcpSchema.AvailableCommand>>;
     /**
      * Sends a prompt turn to the active session. `options.dispatched` settles once the
      * `session/prompt` RPC is registered as the active prompt, so a caller that forks this
@@ -275,6 +300,8 @@ export class AcpSessionRuntime extends Context.Service<
       modelId: string,
       meta?: EffectAcpSchema.SetSessionModelRequest["_meta"],
     ) => Effect.Effect<EffectAcpSchema.SetSessionModelResponse, EffectAcpErrors.AcpError>;
+    /** Returns the latest bounded stderr captured from the ACP process. */
+    readonly getProcessDiagnostics: Effect.Effect<AcpStderrDiagnostic>;
     /**
      * Sends a generic ACP extension request and records it through the request logger.
      * @see https://agentclientprotocol.com/protocol/extensibility
@@ -305,9 +332,18 @@ type AcpStartState =
   | { readonly _tag: "Started"; readonly result: AcpStartedState };
 
 interface AcpAssistantSegmentState {
-  readonly nextSegmentIndex: number;
-  readonly activeItemId?: string;
+  readonly assistant: {
+    readonly nextSegmentIndex: number;
+    readonly activeItemId?: string;
+  };
+  readonly reasoning: {
+    readonly nextSegmentIndex: number;
+    readonly activeItemId?: string;
+  };
 }
+
+type AcpContentItemType = "assistant_message" | "reasoning";
+type AcpContentSegmentKey = "assistant" | "reasoning";
 
 interface EnsureActiveAssistantSegmentResult {
   readonly itemId: string;
@@ -333,6 +369,7 @@ export const make = (
     const eventQueue = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
     const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
     const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallTrackedState>());
+    const terminalToolCallIdsRef = yield* Ref.make(new Set<string>());
     const assistantItemRuntimeId = yield* crypto.randomUUIDv4.pipe(
       Effect.mapError(
         (cause) =>
@@ -342,8 +379,16 @@ export const make = (
           }),
       ),
     );
-    const assistantSegmentRef = yield* Ref.make<AcpAssistantSegmentState>({ nextSegmentIndex: 0 });
+    const assistantSegmentRef = yield* Ref.make<AcpAssistantSegmentState>({
+      assistant: { nextSegmentIndex: 0 },
+      reasoning: { nextSegmentIndex: 0 },
+    });
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
+    const availableCommandsRef = yield* Ref.make<ReadonlyArray<EffectAcpSchema.AvailableCommand>>(
+      [],
+    );
+    const availableCommandsDeferred =
+      yield* Deferred.make<ReadonlyArray<EffectAcpSchema.AvailableCommand>>();
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
     const startupMetadataRef = yield* Ref.make<ReadonlyArray<EffectAcpSchema.SessionNotification>>(
       [],
@@ -358,6 +403,9 @@ export const make = (
     const promptSerializationSemaphore = yield* Semaphore.make(1);
     const promptDispatchSemaphore = yield* Semaphore.make(1);
     const activePromptRef = yield* Ref.make<Option.Option<AcpActivePrompt>>(Option.none());
+    const activeCancelRef = yield* Ref.make<
+      Option.Option<Deferred.Deferred<void, EffectAcpErrors.AcpError>>
+    >(Option.none());
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
 
     const ensureConnected = Effect.gen(function* () {
@@ -387,7 +435,7 @@ export const make = (
       if (!firstTermination) {
         return;
       }
-      yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+      yield* closeActiveAssistantSegments({ queue: eventQueue, assistantSegmentRef });
       yield* Queue.offer(eventQueue, { _tag: "ConnectionTerminated", error });
     });
 
@@ -449,25 +497,64 @@ export const make = (
         ),
       );
 
-    yield* child.stderr.pipe(
-      Stream.decodeText(),
-      Stream.runForEach((chunk) =>
-        (options.onStderr
-          ? options.onStderr(chunk.slice(-maxStderrChunkLength))
-          : Effect.void
-        ).pipe(
-          Effect.catch((error) =>
-            Effect.gen(function* () {
-              yield* Deferred.fail(stderrFailure, error);
-              yield* recordTermination(error);
-              yield* child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
-            }),
+    const diagnosticsDeferred = yield* Deferred.make<AcpStderrDiagnostic>();
+    const emptyDiagnostic = {
+      text: "",
+      truncated: false,
+      invalidUtf8: false,
+    } satisfies AcpStderrDiagnostic;
+    if (options.onStderr) {
+      // Upstream streaming consumer: forward bounded stderr chunks live. The
+      // diagnostics snapshot is not populated in this mode; resolve it as empty
+      // so the process-termination path never blocks awaiting the deferred.
+      const onStderr = options.onStderr;
+      yield* child.stderr.pipe(
+        Stream.decodeText(),
+        Stream.runForEach((chunk) =>
+          onStderr(chunk.slice(-maxStderrChunkLength)).pipe(
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                yield* Deferred.fail(stderrFailure, error);
+                yield* recordTermination(error);
+                yield* child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
+              }),
+            ),
           ),
         ),
+        Effect.ignore,
+        Effect.ensuring(Deferred.succeed(diagnosticsDeferred, emptyDiagnostic).pipe(Effect.ignore)),
+        Effect.forkIn(runtimeScope),
+      );
+    } else {
+      // Pi diagnostics consumer: capture a bounded stderr snapshot to surface in
+      // the process termination error (see layerChildProcess processDiagnostics).
+      yield* collectUint8StreamText({
+        stream: child.stderr,
+        maxBytes: options.stderrMaxBytes ?? defaultStderrMaxBytes,
+        truncatedMarker: stderrTruncatedMarker,
+      }).pipe(
+        Effect.map(
+          (diagnostic): AcpStderrDiagnostic => ({
+            text: diagnostic.text,
+            truncated: diagnostic.truncated,
+            invalidUtf8: diagnostic.invalidUtf8,
+          }),
+        ),
+        Effect.orElseSucceed(() => emptyDiagnostic),
+        Effect.tap((diagnostic) =>
+          options.processDiagnosticLogger ? options.processDiagnosticLogger(diagnostic) : Effect.void,
+        ),
+        Effect.flatMap((diagnostic) => Deferred.succeed(diagnosticsDeferred, diagnostic)),
+        Effect.forkIn(runtimeScope),
+      );
+    }
+
+    const getProcessDiagnostics = Deferred.poll(diagnosticsDeferred).pipe(
+      Effect.flatMap((diagnostic) =>
+        Option.isSome(diagnostic) ? diagnostic.value : Effect.succeed(emptyDiagnostic),
       ),
-      Effect.ignore,
-      Effect.forkIn(runtimeScope),
     );
+
 
     const acpContext = yield* Layer.build(
       EffectAcpClient.layerChildProcess(child, {
@@ -483,6 +570,13 @@ export const make = (
           ? { logOutgoing: options.protocolLogging.logOutgoing }
           : {}),
         ...(options.protocolLogging?.logger ? { logger: options.protocolLogging.logger } : {}),
+        processDiagnostics: Deferred.await(diagnosticsDeferred).pipe(
+          Effect.map((diagnostic) => ({
+            stderr: diagnostic.text,
+            stderrTruncated: diagnostic.truncated,
+            stderrInvalidUtf8: diagnostic.invalidUtf8,
+          })),
+        ),
       }),
     ).pipe(Effect.provideService(Scope.Scope, runtimeScope));
 
@@ -494,6 +588,7 @@ export const make = (
         modeStateRef,
         configOptionsRef,
         toolCallsRef,
+        terminalToolCallIdsRef,
         assistantSegmentRef,
         assistantItemRuntimeId,
         params: notification,
@@ -504,6 +599,23 @@ export const make = (
         Effect.gen(function* () {
           if (Option.isSome(yield* Ref.get(terminationErrorRef))) {
             return;
+          }
+          // Capture available commands whenever they arrive (including during
+          // startup) so getAvailableCommands/awaitAvailableCommands resolve, then
+          // fall through so processSessionUpdate still emits the queue event for
+          // other providers.
+          if (notification.update.sessionUpdate === "available_commands_update") {
+            const commandStartState = yield* Ref.get(startStateRef);
+            if (
+              commandStartState._tag !== "Started" ||
+              notification.sessionId === commandStartState.result.sessionId
+            ) {
+              yield* Ref.set(availableCommandsRef, notification.update.availableCommands);
+              yield* Deferred.succeed(
+                availableCommandsDeferred,
+                notification.update.availableCommands,
+              ).pipe(Effect.ignore);
+            }
           }
           const gate = yield* Ref.get(sessionLoadGateRef);
           if (
@@ -916,19 +1028,61 @@ export const make = (
       yield* child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
     });
 
-    const cancel = Effect.gen(function* () {
+    // Pi acknowledges cancellation through a provider extension request; other
+    // providers use the standard session/cancel notification.
+    const sendCancel = (sessionId: string) =>
+      options.cancelRequestMethod
+        ? runLoggedRequest(
+            options.cancelRequestMethod,
+            { sessionId },
+            acp.raw.request(options.cancelRequestMethod, { sessionId }),
+          )
+        : acp.agent.cancel({ sessionId });
+
+    const cancelOnce = Effect.gen(function* () {
       const started = yield* getStartedState;
       const activePrompt = yield* Ref.get(activePromptRef);
+
+      // Pi flow: cancel through a provider extension request bounded by
+      // cancelTimeout. On timeout, run the provider's timeout handler (or SIGKILL
+      // the bridge) and surface a transport error; on acknowledgement, interrupt
+      // the prompt fiber. This is independent of upstream's cancelBehavior.
+      if (options.cancelRequestMethod) {
+        if (Option.isNone(activePrompt)) {
+          return;
+        }
+        const acknowledged = yield* sendCancel(started.sessionId).pipe(
+          Effect.timeoutOption(options.cancelTimeout ?? defaultCancelTimeout),
+        );
+        if (Option.isNone(acknowledged)) {
+          if (options.onCancelTimeout) {
+            yield* options.onCancelTimeout();
+          } else {
+            yield* child
+              .kill({ killSignal: "SIGKILL", forceKillAfter: "1 second" })
+              .pipe(Effect.ignore);
+          }
+          return yield* new EffectAcpErrors.AcpTransportError({
+            operation: "call-rpc",
+            method: options.cancelRequestMethod,
+            detail: "The ACP agent did not acknowledge cancellation. Its process was stopped.",
+            cause: undefined,
+          });
+        }
+        yield* Fiber.interrupt(activePrompt.value.fiber).pipe(Effect.ignore);
+        return;
+      }
+
       if (options.cancelBehavior !== "wait-for-prompt") {
         if (Option.isSome(activePrompt)) {
           yield* Fiber.interrupt(activePrompt.value.fiber).pipe(Effect.ignore);
         }
         // Write cancel before a replacement prompt can reach the agent.
-        yield* acp.agent.cancel({ sessionId: started.sessionId }).pipe(Effect.ignore);
+        yield* sendCancel(started.sessionId).pipe(Effect.ignore);
         return;
       }
 
-      yield* acp.agent.cancel({ sessionId: started.sessionId });
+      yield* sendCancel(started.sessionId);
       if (Option.isNone(activePrompt)) {
         return;
       }
@@ -943,17 +1097,46 @@ export const make = (
       if (Option.isNone(completed)) {
         const error = new EffectAcpErrors.AcpTransportError({
           operation: "call-rpc",
-          method: "session/cancel",
+          method: options.cancelRequestMethod ?? "session/cancel",
           detail: "The ACP agent did not finish cancellation. Its process was stopped.",
           cause: undefined,
         });
-        yield* retireRuntime(error);
+        // Pi supplies a cancellation-timeout handler (e.g. terminate in-flight
+        // tools); other providers fall back to retiring the runtime.
+        if (options.onCancelTimeout) {
+          yield* options.onCancelTimeout();
+        } else {
+          yield* retireRuntime(error);
+        }
         return yield* error;
       }
       if (Exit.isFailure(completed.value)) {
         return yield* Effect.failCause(completed.value.cause);
       }
     });
+
+    // Pi de-duplicates concurrent cancellations (its extension-request flow can
+    // be invoked re-entrantly); other providers keep upstream's direct cancel.
+    const cancel = options.cancelRequestMethod
+      ? Effect.gen(function* () {
+          const deferred = yield* Deferred.make<void, EffectAcpErrors.AcpError>();
+          const selected: {
+            readonly owner: boolean;
+            readonly deferred: Deferred.Deferred<void, EffectAcpErrors.AcpError>;
+          } = yield* Ref.modify(activeCancelRef, (current) => {
+            if (Option.isSome(current)) {
+              return [{ owner: false, deferred: current.value }, current];
+            }
+            return [{ owner: true, deferred }, Option.some(deferred)];
+          });
+          if (!selected.owner) return yield* Deferred.await(selected.deferred);
+          return yield* cancelOnce.pipe(
+            Effect.tap(() => Deferred.succeed(selected.deferred, undefined)),
+            Effect.tapCause((cause) => Deferred.failCause(selected.deferred, cause)),
+            Effect.ensuring(Ref.set(activeCancelRef, Option.none())),
+          );
+        })
+      : cancelOnce;
 
     return {
       handleRequestPermission: acp.handleRequestPermission,
@@ -977,13 +1160,15 @@ export const make = (
       drainEvents,
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
+      getAvailableCommands: Ref.get(availableCommandsRef),
+      awaitAvailableCommands: Deferred.await(availableCommandsDeferred),
       prompt: (payload, promptOptions?) =>
         promptSerializationSemaphore.withPermit(
           Effect.acquireUseRelease(
             promptDispatchSemaphore.withPermit(
               Effect.gen(function* () {
                 const started = yield* getStartedState;
-                yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+                yield* closeActiveAssistantSegments({ queue: eventQueue, assistantSegmentRef });
                 const requestPayload = {
                   sessionId: started.sessionId,
                   ...payload,
@@ -1012,7 +1197,7 @@ export const make = (
                     : Effect.failCause(cause),
                 ),
                 Effect.tap(() =>
-                  closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef }),
+                  closeActiveAssistantSegments({ queue: eventQueue, assistantSegmentRef }),
                 ),
               ),
             (activePrompt, result) =>
@@ -1073,6 +1258,7 @@ export const make = (
             );
           }),
         ),
+      getProcessDiagnostics,
       request: (method, payload) =>
         ensureConnected.pipe(
           Effect.andThen(runLoggedRequest(method, payload, acp.raw.request(method, payload))),
@@ -1130,6 +1316,7 @@ const handleSessionUpdate = ({
   modeStateRef,
   configOptionsRef,
   toolCallsRef,
+  terminalToolCallIdsRef,
   assistantSegmentRef,
   assistantItemRuntimeId,
   params,
@@ -1138,6 +1325,7 @@ const handleSessionUpdate = ({
   readonly modeStateRef: Ref.Ref<AcpSessionModeState | undefined>;
   readonly configOptionsRef: Ref.Ref<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>;
   readonly toolCallsRef: Ref.Ref<Map<string, AcpToolCallTrackedState>>;
+  readonly terminalToolCallIdsRef: Ref.Ref<Set<string>>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly assistantItemRuntimeId: string;
   readonly params: EffectAcpSchema.SessionNotification;
@@ -1153,12 +1341,20 @@ const handleSessionUpdate = ({
       );
     }
     for (const event of parsed.events) {
+      if (event._tag === "ConfigOptionsUpdated") {
+        yield* Ref.set(configOptionsRef, event.configOptions);
+        yield* Queue.offer(queue, event);
+        continue;
+      }
       if (event._tag === "ToolCallUpdated") {
-        yield* closeActiveAssistantSegment({
+        if ((yield* Ref.get(terminalToolCallIdsRef)).has(event.toolCall.toolCallId)) {
+          continue;
+        }
+        yield* closeActiveAssistantSegments({
           queue,
           assistantSegmentRef,
         });
-        const { merged, decision } = yield* Ref.modify(toolCallsRef, (current) => {
+        const { merged, decision, lifecycle } = yield* Ref.modify(toolCallsRef, (current) => {
           const tracked = current.get(event.toolCall.toolCallId);
           const previous = tracked?.state;
           const nextToolCall = mergeToolCallState(previous, event.toolCall);
@@ -1180,28 +1376,52 @@ const handleSessionUpdate = ({
               skippedSinceEmit: decision.skippedSinceEmit,
             });
           }
-          return [{ merged: nextToolCall, decision }, next] as const;
+          return [
+            {
+              merged: nextToolCall,
+              decision,
+              lifecycle: previous === undefined ? event.lifecycle : ("updated" as const),
+            },
+            next,
+          ] as const;
         });
+        if (merged.status === "completed" || merged.status === "failed") {
+          yield* Ref.update(terminalToolCallIdsRef, (current) =>
+            new Set(current).add(merged.toolCallId),
+          );
+        }
         if (!decision.emit) {
           continue;
         }
         yield* Queue.offer(queue, {
           _tag: "ToolCallUpdated",
+          lifecycle,
           toolCall: merged,
           rawPayload: event.rawPayload,
         });
         continue;
       }
       if (event._tag === "ContentDelta") {
+        const segmentKey: AcpContentSegmentKey =
+          event.streamKind === "reasoning_text" ? "reasoning" : "assistant";
+        const itemType: AcpContentItemType =
+          event.streamKind === "reasoning_text" ? "reasoning" : "assistant_message";
         if (event.text.trim().length === 0) {
           const assistantSegmentState = yield* Ref.get(assistantSegmentRef);
-          if (!assistantSegmentState.activeItemId) {
+          if (!assistantSegmentState[segmentKey].activeItemId) {
             continue;
           }
         }
+        yield* closeActiveAssistantSegments({
+          queue,
+          assistantSegmentRef,
+          except: segmentKey,
+        });
         const itemId = yield* ensureActiveAssistantSegment({
           queue,
           assistantSegmentRef,
+          segmentKey,
+          itemType,
           sessionId: params.sessionId,
           assistantItemRuntimeId,
         });
@@ -1228,38 +1448,59 @@ function updateModeState(modeState: AcpSessionModeState, nextModeId: string): Ac
     : modeState;
 }
 
-const assistantItemId = (sessionId: string, runtimeId: string, segmentIndex: number) =>
-  `assistant:${sessionId}:runtime:${runtimeId}:segment:${segmentIndex}`;
+const assistantItemId = (
+  sessionId: string,
+  runtimeId: string,
+  itemType: AcpContentItemType,
+  segmentIndex: number,
+) => {
+  const itemPrefix = itemType === "assistant_message" ? "assistant" : "reasoning";
+  return `${itemPrefix}:${sessionId}:runtime:${runtimeId}:segment:${segmentIndex}`;
+};
 
 const ensureActiveAssistantSegment = ({
   queue,
   assistantSegmentRef,
+  segmentKey,
+  itemType,
   sessionId,
   assistantItemRuntimeId,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly segmentKey: AcpContentSegmentKey;
+  readonly itemType: AcpContentItemType;
   readonly sessionId: string;
   readonly assistantItemRuntimeId: string;
 }) =>
   Ref.modify<AcpAssistantSegmentState, EnsureActiveAssistantSegmentResult>(
     assistantSegmentRef,
     (current) => {
-      if (current.activeItemId) {
-        return [{ itemId: current.activeItemId }, current] as const;
+      const segment = current[segmentKey];
+      if (segment.activeItemId) {
+        return [{ itemId: segment.activeItemId }, current] as const;
       }
-      const itemId = assistantItemId(sessionId, assistantItemRuntimeId, current.nextSegmentIndex);
+      const itemId = assistantItemId(
+        sessionId,
+        assistantItemRuntimeId,
+        itemType,
+        segment.nextSegmentIndex,
+      );
       return [
         {
           itemId,
           startedEvent: {
             _tag: "AssistantItemStarted",
             itemId,
+            itemType,
           } satisfies Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>,
         },
         {
-          nextSegmentIndex: current.nextSegmentIndex + 1,
-          activeItemId: itemId,
+          ...current,
+          [segmentKey]: {
+            nextSegmentIndex: segment.nextSegmentIndex + 1,
+            activeItemId: itemId,
+          },
         } satisfies AcpAssistantSegmentState,
       ] as const;
     },
@@ -1271,24 +1512,38 @@ const ensureActiveAssistantSegment = ({
     ),
   );
 
-const closeActiveAssistantSegment = ({
+const closeActiveAssistantSegments = ({
   queue,
   assistantSegmentRef,
+  except,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
+  readonly except?: AcpContentSegmentKey;
 }) =>
   Ref.modify(assistantSegmentRef, (current) => {
-    if (!current.activeItemId) {
-      return [undefined, current] as const;
-    }
+    const events: Array<AcpParsedSessionEvent> = [];
+    const close = (segmentKey: AcpContentSegmentKey, itemType: AcpContentItemType) => {
+      const segment = current[segmentKey];
+      if (segmentKey !== except && segment.activeItemId) {
+        events.push({
+          _tag: "AssistantItemCompleted",
+          itemId: segment.activeItemId,
+          itemType,
+        });
+        return { nextSegmentIndex: segment.nextSegmentIndex };
+      }
+      return segment;
+    };
     return [
+      events,
       {
-        _tag: "AssistantItemCompleted",
-        itemId: current.activeItemId,
-      } satisfies AcpParsedSessionEvent,
-      {
-        nextSegmentIndex: current.nextSegmentIndex,
-      } satisfies AcpAssistantSegmentState,
+        assistant: close("assistant", "assistant_message"),
+        reasoning: close("reasoning", "reasoning"),
+      },
     ] as const;
-  }).pipe(Effect.flatMap((event) => (event ? Queue.offer(queue, event) : Effect.void)));
+  }).pipe(
+    Effect.flatMap((events) =>
+      Effect.forEach(events, (event) => Queue.offer(queue, event), { discard: true }),
+    ),
+  );

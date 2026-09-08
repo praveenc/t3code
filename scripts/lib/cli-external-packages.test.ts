@@ -69,6 +69,10 @@ describe("shouldBundleCliDependency", () => {
 });
 
 describe("selectCliRuntimeExternalDependencies", () => {
+  it("pins the spawned Pi ACP bridge exactly", () => {
+    assert.strictEqual(serverPackageJson.dependencies["pi-acp"], "0.0.33");
+  });
+
   it("keeps only runtime-external dependency roots for the Windows sidecar", () => {
     assert.deepStrictEqual(
       selectCliRuntimeExternalDependencies({
@@ -76,10 +80,12 @@ describe("selectCliRuntimeExternalDependencies", () => {
         "@ff-labs/fff-node": "2.0.0",
         effect: "3.0.0",
         "node-pty": "4.0.0",
+        "pi-acp": "0.0.33",
       }),
       {
         "@ff-labs/fff-node": "2.0.0",
         "node-pty": "4.0.0",
+        "pi-acp": "0.0.33",
       },
     );
   });
@@ -87,7 +93,7 @@ describe("selectCliRuntimeExternalDependencies", () => {
   it("selects every external root declared by the server", () => {
     assert.deepStrictEqual(
       Object.keys(selectCliRuntimeExternalDependencies(serverPackageJson.dependencies)).sort(),
-      ["@ff-labs/fff-node", "msgpackr-extract", "node-pty"],
+      ["@ff-labs/fff-node", "msgpackr-extract", "node-pty", "pi-acp"],
     );
   });
 });
@@ -194,9 +200,9 @@ it.layer(NodeServices.layer)("external package dependency closure", (it) => {
         if (!manifest) continue;
 
         const declared = {
-          ...(manifest.dependencies ?? {}),
-          ...(manifest.optionalDependencies ?? {}),
-          ...(manifest.peerDependencies ?? {}),
+          ...manifest.dependencies,
+          ...manifest.optionalDependencies,
+          ...manifest.peerDependencies,
         };
         for (const dependency of Object.keys(declared)) {
           if (!isRuntimeExternal(dependency)) {

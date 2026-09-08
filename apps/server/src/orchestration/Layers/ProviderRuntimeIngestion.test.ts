@@ -1085,6 +1085,51 @@ describe("ProviderRuntimeIngestion", () => {
     );
   });
 
+  it.each(["interrupted", "cancelled"] as const)(
+    "projects a %s runtime turn completion as interrupted",
+    async (state) => {
+      const harness = await createHarness();
+      const now = "2026-01-01T00:00:00.000Z";
+      const turnId = asTurnId(`turn-${state}`);
+
+      harness.emit({
+        type: "turn.started",
+        eventId: asEventId(`evt-turn-started-${state}`),
+        provider: ProviderDriverKind.make("piAgent"),
+        createdAt: now,
+        threadId: asThreadId("thread-1"),
+        turnId,
+      });
+
+      await waitForThread(
+        harness.readModel,
+        (thread) => thread.session?.status === "running" && thread.session.activeTurnId === turnId,
+        10_000,
+      );
+
+      harness.emit({
+        type: "turn.completed",
+        eventId: asEventId(`evt-turn-completed-${state}`),
+        provider: ProviderDriverKind.make("piAgent"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId: asThreadId("thread-1"),
+        turnId,
+        status: state,
+      });
+
+      const thread = await waitForThread(
+        harness.readModel,
+        (candidate) =>
+          candidate.session?.status === "interrupted" &&
+          candidate.session.activeTurnId === null &&
+          candidate.latestTurn?.state === "interrupted",
+        10_000,
+      );
+      expect(thread.session?.status).toBe("interrupted");
+      expect(thread.latestTurn?.state).toBe("interrupted");
+    },
+  );
+
   it("accepts claude turn lifecycle when seeded thread id is a synthetic placeholder", async () => {
     const harness = await createHarness();
     const seededAt = "2026-01-01T00:00:00.000Z";

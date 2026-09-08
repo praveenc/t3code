@@ -168,6 +168,32 @@ describe("AcpCoreRuntimeEvents", () => {
         provider: ProviderDriverKind.make("cursor"),
         threadId: "thread-1" as never,
         turnId,
+        lifecycle: "started",
+        toolCall: {
+          toolCallId: "tool-1",
+          kind: "execute",
+          status: "pending",
+          title: "Terminal",
+          detail: "bun run test",
+          data: { command: "bun run test" },
+        },
+        rawPayload: { sessionId: "session-1" },
+      }),
+    ).toMatchObject({
+      type: "item.started",
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+      },
+    });
+
+    expect(
+      makeAcpToolCallEvent({
+        stamp,
+        provider: ProviderDriverKind.make("cursor"),
+        threadId: "thread-1" as never,
+        turnId,
+        lifecycle: "updated",
         toolCall: {
           toolCallId: "tool-1",
           kind: "execute",
@@ -193,6 +219,7 @@ describe("AcpCoreRuntimeEvents", () => {
         threadId: "thread-1" as never,
         turnId,
         itemId: "assistant:session-1:segment:0",
+        streamKind: "reasoning_text",
         text: "hello",
         rawPayload: { sessionId: "session-1" },
       }),
@@ -200,6 +227,7 @@ describe("AcpCoreRuntimeEvents", () => {
       type: "content.delta",
       itemId: "assistant:session-1:segment:0",
       payload: {
+        streamKind: "reasoning_text",
         delta: "hello",
       },
     });
@@ -210,14 +238,15 @@ describe("AcpCoreRuntimeEvents", () => {
         provider: ProviderDriverKind.make("cursor"),
         threadId: "thread-1" as never,
         turnId,
-        itemId: "assistant:session-1:segment:0",
+        itemId: "reasoning:session-1:segment:0",
+        itemType: "reasoning",
         lifecycle: "item.started",
       }),
     ).toMatchObject({
       type: "item.started",
-      itemId: "assistant:session-1:segment:0",
+      itemId: "reasoning:session-1:segment:0",
       payload: {
-        itemType: "assistant_message",
+        itemType: "reasoning",
         status: "inProgress",
       },
     });

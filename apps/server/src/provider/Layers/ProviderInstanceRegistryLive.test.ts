@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 /**
  * Multi-instance validation slices for `ProviderInstanceRegistryLive`.
  *
@@ -16,12 +17,16 @@
  *     across every provider — any driver plugs into the registry through
  *     the same `ProviderDriver` value contract.
  *
- * Every instance in these tests is configured with `enabled: false` so the
- * provider-status checks short-circuit to pending/disabled snapshots
- * without trying to spawn real `codex` / `claude` / `agent` / `grok` / `opencode`
- * binaries. That keeps the assertions focused on registry routing
- * behaviour rather than the runtime details of each provider.
+ * Every existing-provider instance in these tests is configured with `enabled: false` so
+ * status checks short-circuit without spawning its real binary. The Pi compatibility
+ * test is the exception: it uses the controlled ACP peer and temporary executable
+ * shims to exercise the registered driver without relying on external installations.
  */
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
+
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -30,13 +35,17 @@ import {
   type CursorSettings,
   type GrokSettings,
   type OpenCodeSettings,
+  type PiSettings,
+  type ProviderRuntimeEvent,
   ProviderDriverKind,
   type ProviderInstanceConfigMap,
   ProviderInstanceId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { isHostWindows } from "@t3tools/shared/hostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -54,11 +63,13 @@ import { CodexDriver } from "../Drivers/CodexDriver.ts";
 import { CursorDriver } from "../Drivers/CursorDriver.ts";
 import { GrokDriver } from "../Drivers/GrokDriver.ts";
 import { OpenCodeDriver } from "../Drivers/OpenCodeDriver.ts";
+import { PiDriver } from "../Drivers/PiDriver.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
 import * as CodexResetCredit from "./codexResetCredit.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
 import { makeProviderInstanceRegistry } from "./ProviderInstanceRegistryLive.ts";
+import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 
 const TestHttpClientLive = Layer.succeed(
   HttpClient.HttpClient,
@@ -68,6 +79,26 @@ const TestHttpClientLive = Layer.succeed(
 );
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
+const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
+const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
+
+function makePiWrapper(dir: string, environment: Record<string, string>): string {
+  const wrapperPath = NodePath.join(dir, "pi-acp");
+  NodeFS.writeFileSync(
+    wrapperPath,
+    [
+      "#!/bin/sh",
+      ...Object.entries(environment).map(
+        ([key, value]) => `export ${key}=${JSON.stringify(value)}`,
+      ),
+      `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(mockAgentPath)}`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  NodeFS.chmodSync(wrapperPath, 0o755);
+  return wrapperPath;
+}
 
 const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
   reportClientActivity: () => Effect.void,
@@ -214,6 +245,14 @@ const makeTildeProviderFixtures = Effect.fn(
     claudeHomePath,
     codexScriptPath,
   };
+});
+
+const makePiConfig = (overrides: Partial<PiSettings>): PiSettings => ({
+  enabled: false,
+  binaryPath: "pi-acp",
+  piBinaryPath: "pi",
+  customModels: [],
+  ...overrides,
 });
 
 describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
@@ -462,6 +501,166 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
     Layer.provideMerge(CodexResetCredit.layerTest),
   );
 
+  it.live("runs Pi discovery and streaming through the registered driver", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pi-driver-e2e-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
+      );
+      const exitLogPath = NodePath.join(tempDir, "exit.log");
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const piBinaryPath = NodePath.join(tempDir, "pi");
+      NodeFS.writeFileSync(piBinaryPath, '#!/bin/sh\nprintf "0.85.1\\n"\n', "utf8");
+      NodeFS.chmodSync(piBinaryPath, 0o755);
+      const bridgePath = makePiWrapper(tempDir, {
+        T3_ACP_EXIT_LOG_PATH: exitLogPath,
+        T3_ACP_PI_DISCOVERY: "1",
+        T3_ACP_EMIT_PI_COMMANDS: "1",
+        T3_ACP_EMIT_PI_CONFIG_UPDATE: "1",
+        T3_ACP_EMIT_PI_THOUGHT: "1",
+        T3_ACP_EMIT_PI_TOOL_EVENTS: "1",
+        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      });
+      const piId = ProviderInstanceId.make("pi_e2e");
+      const piDriverKind = ProviderDriverKind.make("piAgent");
+      const { registry } = yield* makeProviderInstanceRegistry<BuiltInDriversEnv>({
+        drivers: BUILT_IN_DRIVERS,
+        configMap: {
+          [piId]: {
+            driver: piDriverKind,
+            displayName: "Pi compatibility test",
+            enabled: true,
+            config: makePiConfig({
+              enabled: true,
+              binaryPath: bridgePath,
+              piBinaryPath,
+            }),
+          },
+        },
+      });
+
+      const pi = yield* registry.getInstance(piId);
+      expect(pi).toBeDefined();
+      const snapshot = yield* pi!.snapshot.refresh;
+      expect(snapshot).toMatchObject({
+        instanceId: piId,
+        driver: piDriverKind,
+        displayName: "Pi compatibility test",
+        enabled: true,
+        installed: true,
+        status: "ready",
+        auth: { status: "authenticated" },
+        showInteractionModeToggle: false,
+      });
+      expect(snapshot.models.map((model) => model.slug)).toEqual([
+        "anthropic/claude-sonnet-4-6",
+        "openai/gpt-5.4",
+      ]);
+      expect(snapshot.slashCommands.map((command) => command.name)).toEqual(["review"]);
+      expect(snapshot.skills.map((skill) => skill.name)).toEqual(["browser"]);
+
+      const threadId = ThreadId.make("pi-driver-e2e");
+      const events: ProviderRuntimeEvent[] = [];
+      const eventFiber = yield* pi!.adapter.streamEvents.pipe(
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            events.push(event);
+          }),
+        ),
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      const session = yield* pi!.adapter.startSession({
+        threadId,
+        provider: piDriverKind,
+        cwd: tempDir,
+        runtimeMode: "approval-required",
+        modelSelection: {
+          instanceId: piId,
+          model: "openai/gpt-5.4",
+          options: [{ id: "thinkingLevel", value: "xhigh" }],
+        },
+      });
+      expect(session.resumeCursor).toEqual({ schemaVersion: 1, sessionId: "mock-session-1" });
+      const turn = yield* pi!.adapter.sendTurn({
+        threadId,
+        input: "exercise the registered Pi provider",
+        attachments: [],
+      });
+      yield* Effect.yieldNow;
+
+      const turnEvents = events.filter((event) => event.turnId === turn.turnId);
+      expect(turnEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "content.delta",
+            payload: expect.objectContaining({ streamKind: "reasoning_text" }),
+          }),
+          expect.objectContaining({
+            type: "content.delta",
+            itemId: "pi-command-1",
+            payload: { streamKind: "command_output", delta: "hello" },
+          }),
+          expect.objectContaining({ type: "turn.diff.updated", itemId: "pi-edit-1" }),
+          expect.objectContaining({ type: "session.configured" }),
+          expect.objectContaining({
+            type: "turn.completed",
+            payload: expect.objectContaining({ state: "completed" }),
+          }),
+        ]),
+      );
+      expect(turnEvents.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+
+      const requests = NodeFS.readFileSync(requestLogPath, "utf8");
+      expect(requests).toMatch(
+        /"value":"openai\/gpt-5\.4","configId":"model"|"configId":"model","value":"openai\/gpt-5\.4"/,
+      );
+      expect(requests).toMatch(
+        /"value":"xhigh","configId":"thought_level"|"configId":"thought_level","value":"xhigh"/,
+      );
+
+      yield* pi!.adapter.stopSession(threadId);
+      expect(yield* pi!.adapter.hasSession(threadId)).toBe(false);
+      expect(NodeFS.readFileSync(exitLogPath, "utf8")).toContain("SIGTERM");
+      yield* Fiber.interrupt(eventFiber);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("registers the Pi driver and keeps its default instance disabled", () =>
+    Effect.gen(function* () {
+      const piDriverKind = ProviderDriverKind.make("piAgent");
+      const piId = ProviderInstanceId.make("piAgent");
+      expect(BUILT_IN_DRIVERS.map((driver) => driver.driverKind)).toContain(piDriverKind);
+
+      const { registry } = yield* makeProviderInstanceRegistry<BuiltInDriversEnv>({
+        drivers: BUILT_IN_DRIVERS,
+        configMap: {
+          [piId]: {
+            driver: piDriverKind,
+            config: makePiConfig({}),
+          },
+        },
+      });
+
+      expect(yield* registry.listUnavailable).toEqual([]);
+      const pi = yield* registry.getInstance(piId);
+      expect(pi?.driverKind).toBe(piDriverKind);
+      expect(pi?.enabled).toBe(false);
+      expect(pi?.adapter.provider).toBe(piDriverKind);
+      expect(pi?.textGeneration).toBeDefined();
+      const snapshot = yield* pi!.snapshot.getSnapshot;
+      expect(snapshot).toMatchObject({
+        instanceId: piId,
+        driver: piDriverKind,
+        enabled: false,
+        status: "disabled",
+        installed: false,
+        message: "Pi Agent is disabled in T3 Code settings.",
+      });
+      expect(snapshot.continuation?.groupKey).toBe(`${piDriverKind}:instance:${piId}`);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("boots one instance of every shipped driver from a single config map", () =>
     Effect.gen(function* () {
       const codexId = ProviderInstanceId.make("codex_default");
@@ -469,12 +668,14 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       const cursorId = ProviderInstanceId.make("cursor_default");
       const grokId = ProviderInstanceId.make("grok_default");
       const openCodeId = ProviderInstanceId.make("opencode_default");
+      const piId = ProviderInstanceId.make("pi_default");
 
       const codexDriverKind = ProviderDriverKind.make("codex");
       const claudeDriverKind = ProviderDriverKind.make("claudeAgent");
       const cursorDriverKind = ProviderDriverKind.make("cursor");
       const grokDriverKind = ProviderDriverKind.make("grok");
       const openCodeDriverKind = ProviderDriverKind.make("opencode");
+      const piDriverKind = ProviderDriverKind.make("piAgent");
 
       const configMap: ProviderInstanceConfigMap = {
         [codexId]: {
@@ -510,10 +711,16 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
           enabled: false,
           config: makeOpenCodeConfig({}),
         },
+        [piId]: {
+          driver: piDriverKind,
+          displayName: "Pi Agent",
+          enabled: false,
+          config: makePiConfig({}),
+        },
       };
 
       const { registry } = yield* makeProviderInstanceRegistry<BuiltInDriversEnv>({
-        drivers: [CodexDriver, ClaudeDriver, CursorDriver, GrokDriver, OpenCodeDriver],
+        drivers: [CodexDriver, ClaudeDriver, PiDriver, CursorDriver, GrokDriver, OpenCodeDriver],
         configMap,
       });
 
@@ -523,9 +730,9 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       expect(unavailable).toEqual([]);
 
       const instances = yield* registry.listInstances;
-      expect(instances).toHaveLength(5);
+      expect(instances).toHaveLength(6);
       expect(instances.map((instance) => instance.instanceId).toSorted()).toEqual(
-        [codexId, claudeId, cursorId, grokId, openCodeId].toSorted(),
+        [codexId, claudeId, cursorId, grokId, openCodeId, piId].toSorted(),
       );
 
       // Instance lookup by id resolves each instance to its own bundle —
@@ -536,16 +743,19 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       const cursor = yield* registry.getInstance(cursorId);
       const grok = yield* registry.getInstance(grokId);
       const openCode = yield* registry.getInstance(openCodeId);
+      const pi = yield* registry.getInstance(piId);
       expect(codex?.driverKind).toBe(codexDriverKind);
       expect(claude?.driverKind).toBe(claudeDriverKind);
       expect(cursor?.driverKind).toBe(cursorDriverKind);
       expect(grok?.driverKind).toBe(grokDriverKind);
       expect(openCode?.driverKind).toBe(openCodeDriverKind);
+      expect(pi?.driverKind).toBe(piDriverKind);
       expect(codex?.displayName).toBe("Codex");
       expect(claude?.displayName).toBe("Claude");
       expect(cursor?.displayName).toBe("Cursor");
       expect(grok?.displayName).toBe("Grok");
       expect(openCode?.displayName).toBe("OpenCode");
+      expect(pi?.displayName).toBe("Pi Agent");
 
       // Every instance owns its own set of closures — no sharing across
       // drivers. `adapter` / `textGeneration` / `snapshot` are all
@@ -558,6 +768,7 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
         cursor!.adapter,
         grok!.adapter,
         openCode!.adapter,
+        pi!.adapter,
       ];
       expect(new Set(adapters).size).toBe(adapters.length);
       const textGenerations = [
@@ -566,6 +777,7 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
         cursor!.textGeneration,
         grok!.textGeneration,
         openCode!.textGeneration,
+        pi!.textGeneration,
       ];
       expect(new Set(textGenerations).size).toBe(textGenerations.length);
       const snapshots = [
@@ -574,6 +786,7 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
         cursor!.snapshot,
         grok!.snapshot,
         openCode!.snapshot,
+        pi!.snapshot,
       ];
       expect(new Set(snapshots).size).toBe(snapshots.length);
 
@@ -620,6 +833,12 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       expect(openCodeSnapshot.continuation?.groupKey).toBe(
         `${openCodeDriverKind}:instance:${openCodeId}`,
       );
+
+      const piSnapshot = yield* pi!.snapshot.getSnapshot;
+      expect(piSnapshot.instanceId).toBe(piId);
+      expect(piSnapshot.driver).toBe(piDriverKind);
+      expect(piSnapshot.enabled).toBe(false);
+      expect(piSnapshot.continuation?.groupKey).toBe(`${piDriverKind}:instance:${piId}`);
     }).pipe(Effect.provide(testLayer)),
   );
 });

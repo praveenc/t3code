@@ -922,6 +922,10 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           claudeAgent: {
             binaryPath: "  /opt/homebrew/bin/claude  ",
           },
+          piAgent: {
+            binaryPath: "  /opt/homebrew/bin/pi-acp  ",
+            piBinaryPath: "  /opt/homebrew/bin/pi  ",
+          },
           opencode: {
             binaryPath: "  /opt/homebrew/bin/opencode  ",
             serverUrl: "  http://127.0.0.1:4096  ",
@@ -946,6 +950,12 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         launchArgs: "",
         autoCompactWindow: "",
       });
+      assert.deepEqual(next.providers.piAgent, {
+        enabled: false,
+        binaryPath: "/opt/homebrew/bin/pi-acp",
+        piBinaryPath: "/opt/homebrew/bin/pi",
+        customModels: [],
+      });
       assert.deepEqual(next.providers.opencode, {
         // OpenCode is disabled by default; this update only touches paths.
         enabled: false,
@@ -954,6 +964,69 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         serverPassword: "secret-password",
         customModels: [],
       });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("persists Pi provider configuration and text-generation selection", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const piInstanceId = ProviderInstanceId.make("piAgent");
+
+      const next = yield* serverSettings.updateSettings({
+        providers: {
+          piAgent: {
+            enabled: true,
+            binaryPath: "  /opt/pi/bin/pi-acp  ",
+            piBinaryPath: "  /opt/pi/bin/pi  ",
+            customModels: ["anthropic/claude-sonnet-4-6"],
+          },
+        },
+        textGenerationModelSelection: {
+          instanceId: piInstanceId,
+          model: "anthropic/claude-sonnet-4-6",
+          options: [{ id: "thinkingLevel", value: "high" }],
+        },
+      });
+
+      assert.deepEqual(next.providers.piAgent, {
+        enabled: true,
+        binaryPath: "/opt/pi/bin/pi-acp",
+        piBinaryPath: "/opt/pi/bin/pi",
+        customModels: ["anthropic/claude-sonnet-4-6"],
+      });
+      assert.deepEqual(next.textGenerationModelSelection, {
+        instanceId: piInstanceId,
+        model: "anthropic/claude-sonnet-4-6",
+        options: [{ id: "thinkingLevel", value: "high" }],
+      });
+
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      // Inspect raw persisted JSON before schema decoding can apply defaults.
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const persisted = JSON.parse(raw) as {
+        providers?: Record<string, unknown>;
+        textGenerationModelSelection?: unknown;
+      };
+      assert.deepEqual(persisted.providers?.piAgent, {
+        enabled: true,
+        binaryPath: "/opt/pi/bin/pi-acp",
+        piBinaryPath: "/opt/pi/bin/pi",
+        customModels: ["anthropic/claude-sonnet-4-6"],
+      });
+      assert.deepEqual(persisted.textGenerationModelSelection, {
+        instanceId: "piAgent",
+        model: "anthropic/claude-sonnet-4-6",
+        options: [{ id: "thinkingLevel", value: "high" }],
+      });
+
+      const roundTripped = yield* serverSettings.getSettings;
+      assert.deepEqual(roundTripped.providers.piAgent, next.providers.piAgent);
+      assert.deepEqual(
+        roundTripped.textGenerationModelSelection,
+        next.textGenerationModelSelection,
+      );
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -989,11 +1062,17 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           claudeAgent: {
             binaryPath: "",
           },
+          piAgent: {
+            binaryPath: "   ",
+            piBinaryPath: "",
+          },
         },
       });
 
       assert.equal(next.providers.codex.binaryPath, "codex");
       assert.equal(next.providers.claudeAgent.binaryPath, "claude");
+      assert.equal(next.providers.piAgent.binaryPath, "pi-acp");
+      assert.equal(next.providers.piAgent.piBinaryPath, "pi");
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 

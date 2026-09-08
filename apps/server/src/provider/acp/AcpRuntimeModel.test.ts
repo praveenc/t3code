@@ -181,6 +181,7 @@ describe("AcpRuntimeModel", () => {
     expect(created.events).toEqual([
       {
         _tag: "ToolCallUpdated",
+        lifecycle: "started",
         toolCall: {
           toolCallId: "tool-1",
           kind: "execute",
@@ -324,6 +325,7 @@ describe("AcpRuntimeModel", () => {
     expect(contentResult.events).toEqual([
       {
         _tag: "ContentDelta",
+        streamKind: "assistant_text",
         text: "hello from acp",
         rawPayload: {
           sessionId: "session-1",
@@ -332,6 +334,35 @@ describe("AcpRuntimeModel", () => {
             content: {
               type: "text",
               text: "hello from acp",
+            },
+          },
+        },
+      },
+    ]);
+
+    const thoughtResult = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_thought_chunk",
+        content: {
+          type: "text",
+          text: "checking the implementation",
+        },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(thoughtResult.events).toEqual([
+      {
+        _tag: "ContentDelta",
+        streamKind: "reasoning_text",
+        text: "checking the implementation",
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: {
+              type: "text",
+              text: "checking the implementation",
             },
           },
         },
@@ -350,7 +381,8 @@ describe("AcpRuntimeModel", () => {
 
     expect(parseSessionUpdateEvent(notification).events).toEqual([
       {
-        _tag: "ThoughtDelta",
+        _tag: "ContentDelta",
+        streamKind: "reasoning_text",
         text: "Inspect the current implementation first.",
         rawPayload: notification,
       },
@@ -534,6 +566,98 @@ describe("AcpRuntimeModel", () => {
     // latest output rather than a stale coalesced value.
     expect(finalDetail).toBeDefined();
     expect(finalDetail?.endsWith(`frame 999: ${"#".repeat(50)}`)).toBe(true);
+  });
+
+  it("keeps the first terminal tool state when late updates regress it", () => {
+    const completed: AcpToolCallState = {
+      toolCallId: "tool-1",
+      status: "completed",
+      detail: "done",
+      data: {},
+    };
+    expect(
+      mergeToolCallState(completed, {
+        toolCallId: "tool-1",
+        status: "inProgress",
+        detail: "late progress",
+        data: {},
+      }),
+    ).toEqual(completed);
+  });
+
+  it("maps Pi terminal output, structured diffs, retries, and config changes", () => {
+    const terminal = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "command-1",
+        status: "in_progress",
+        _meta: { terminal_output: { terminal_id: "command-1", data: "hello\n" } },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+    expect(terminal.events).toMatchObject([
+      { _tag: "ToolCallUpdated", lifecycle: "updated" },
+      {
+        _tag: "ToolCallContentDelta",
+        itemId: "command-1",
+        streamKind: "command_output",
+        text: "hello\n",
+      },
+    ]);
+
+    const diff = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "edit-1",
+        status: "completed",
+        content: [
+          {
+            type: "diff",
+            path: "src/example.ts",
+            oldText: "const value = 1;",
+            newText: "const value = 2;",
+          },
+        ],
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+    expect(diff.events[1]).toMatchObject({
+      _tag: "TurnDiffUpdated",
+      itemId: "edit-1",
+      unifiedDiff: expect.stringContaining("--- a/src/example.ts\n+++ b/src/example.ts"),
+    });
+
+    const retry = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Retrying (attempt 2/3, waiting 1s)..." },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+    expect(retry.events).toMatchObject([
+      {
+        _tag: "ContentDelta",
+        streamKind: "assistant_text",
+        text: "Retrying (attempt 2/3, waiting 1s)...",
+      },
+    ]);
+
+    const configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> = [
+      {
+        id: "thought_level",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "xhigh",
+        options: [{ value: "xhigh", name: "Thinking: xhigh" }],
+      },
+    ];
+    expect(
+      parseSessionUpdateEvent({
+        sessionId: "session-1",
+        update: { sessionUpdate: "config_option_update", configOptions },
+      } satisfies EffectAcpSchema.SessionNotification).events,
+    ).toMatchObject([{ _tag: "ConfigOptionsUpdated", configOptions }]);
   });
 
   it("keeps non-text tool call content entries in order when bounding oversized text", () => {

@@ -98,10 +98,12 @@ export type AcpParsedSessionEvent =
   | {
       readonly _tag: "AssistantItemStarted";
       readonly itemId: string;
+      readonly itemType: "assistant_message" | "reasoning";
     }
   | {
       readonly _tag: "AssistantItemCompleted";
       readonly itemId: string;
+      readonly itemType: "assistant_message" | "reasoning";
     }
   | {
       readonly _tag: "PlanUpdated";
@@ -110,12 +112,32 @@ export type AcpParsedSessionEvent =
     }
   | {
       readonly _tag: "ToolCallUpdated";
+      readonly lifecycle?: "started" | "updated" | undefined;
       readonly toolCall: AcpToolCallState;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "ToolCallContentDelta";
+      readonly itemId: string;
+      readonly streamKind: "command_output" | "file_change_output";
+      readonly text: string;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "TurnDiffUpdated";
+      readonly itemId: string;
+      readonly unifiedDiff: string;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "RuntimeWarning";
+      readonly message: string;
       readonly rawPayload: unknown;
     }
   | {
       readonly _tag: "ContentDelta";
       readonly itemId?: string;
+      readonly streamKind?: "assistant_text" | "reasoning_text" | undefined;
       readonly text: string;
       readonly rawPayload: unknown;
     }
@@ -565,6 +587,9 @@ export function mergeToolCallState(
   previous: AcpToolCallState | undefined,
   next: AcpToolCallState,
 ): AcpToolCallState {
+  if (previous?.status === "completed" || previous?.status === "failed") {
+    return previous;
+  }
   const nextKind = typeof next.data.kind === "string" ? next.data.kind : undefined;
   const kind = nextKind ?? previous?.kind;
   const title = next.title ?? previous?.title;
@@ -784,6 +809,58 @@ function boundToolCallRawPayload(
   };
 }
 
+function acpTerminalOutputDelta(params: EffectAcpSchema.SessionNotification): string | undefined {
+  const meta = params.update._meta;
+  if (!isRecord(meta) || !isRecord(meta.terminal_output)) {
+    return undefined;
+  }
+  const data = meta.terminal_output.data;
+  return typeof data === "string" && data.length > 0 ? data : undefined;
+}
+
+function acpRuntimeWarning(params: EffectAcpSchema.SessionNotification): string | undefined {
+  const text =
+    params.update.sessionUpdate === "agent_message_chunk" && params.update.content.type === "text"
+      ? params.update.content.text.trim()
+      : "";
+  const meta = params.update._meta;
+  if (!isRecord(meta) || !isRecord(meta.piAcp) || !isRecord(meta.piAcp.notify)) {
+    return undefined;
+  }
+  const level = meta.piAcp.notify.level;
+  return level === "warning" || level === "error"
+    ? text || "Pi reported a provider warning."
+    : undefined;
+}
+
+function unifiedDiffFromToolCallContent(
+  content: ReadonlyArray<EffectAcpSchema.ToolCallContent> | null | undefined,
+): string | undefined {
+  if (!content) {
+    return undefined;
+  }
+  const diffs = content.flatMap((entry) => {
+    if (entry.type !== "diff") {
+      return [];
+    }
+    const path = entry.path.trim();
+    if (!path) {
+      return [];
+    }
+    const oldText = entry.oldText ?? "";
+    return [
+      [
+        `--- a/${path}`,
+        `+++ b/${path}`,
+        `@@ -1,${oldText.split("\n").length} +1,${entry.newText.split("\n").length} @@`,
+        ...oldText.split("\n").map((line) => `-${line}`),
+        ...entry.newText.split("\n").map((line) => `+${line}`),
+      ].join("\n"),
+    ];
+  });
+  return diffs.length > 0 ? `${diffs.join("\n")}\n` : undefined;
+}
+
 export function parseSessionUpdateEvent(params: EffectAcpSchema.SessionNotification): {
   readonly modeId?: string;
   readonly events: ReadonlyArray<AcpParsedSessionEvent>;
@@ -842,9 +919,29 @@ export function parseSessionUpdateEvent(params: EffectAcpSchema.SessionNotificat
       if (toolCall) {
         events.push({
           _tag: "ToolCallUpdated",
+          lifecycle: "started",
           toolCall,
           rawPayload: boundToolCallRawPayload(params, upd, toolCall),
         });
+        const terminalOutput = acpTerminalOutputDelta(params);
+        if (terminalOutput) {
+          events.push({
+            _tag: "ToolCallContentDelta",
+            itemId: toolCall.toolCallId,
+            streamKind: "command_output",
+            text: terminalOutput,
+            rawPayload: params,
+          });
+        }
+        const unifiedDiff = unifiedDiffFromToolCallContent(upd.content);
+        if (unifiedDiff) {
+          events.push({
+            _tag: "TurnDiffUpdated",
+            itemId: toolCall.toolCallId,
+            unifiedDiff,
+            rawPayload: params,
+          });
+        }
       }
       break;
     }
@@ -853,26 +950,48 @@ export function parseSessionUpdateEvent(params: EffectAcpSchema.SessionNotificat
       if (toolCall) {
         events.push({
           _tag: "ToolCallUpdated",
+          lifecycle: "updated",
           toolCall,
           rawPayload: boundToolCallRawPayload(params, upd, toolCall),
         });
+        const terminalOutput = acpTerminalOutputDelta(params);
+        if (terminalOutput) {
+          events.push({
+            _tag: "ToolCallContentDelta",
+            itemId: toolCall.toolCallId,
+            streamKind: "command_output",
+            text: terminalOutput,
+            rawPayload: params,
+          });
+        }
+        const unifiedDiff = unifiedDiffFromToolCallContent(upd.content);
+        if (unifiedDiff) {
+          events.push({
+            _tag: "TurnDiffUpdated",
+            itemId: toolCall.toolCallId,
+            unifiedDiff,
+            rawPayload: params,
+          });
+        }
       }
       break;
     }
-    case "agent_message_chunk": {
+    case "agent_message_chunk":
+    case "agent_thought_chunk": {
+      const warning = acpRuntimeWarning(params);
+      if (warning) {
+        events.push({
+          _tag: "RuntimeWarning",
+          message: warning,
+          rawPayload: params,
+        });
+        break;
+      }
       if (upd.content.type === "text" && upd.content.text.length > 0) {
         events.push({
           _tag: "ContentDelta",
-          text: upd.content.text,
-          rawPayload: params,
-        });
-      }
-      break;
-    }
-    case "agent_thought_chunk": {
-      if (upd.content.type === "text" && upd.content.text.length > 0) {
-        events.push({
-          _tag: "ThoughtDelta",
+          streamKind:
+            upd.sessionUpdate === "agent_thought_chunk" ? "reasoning_text" : "assistant_text",
           text: upd.content.text,
           rawPayload: params,
         });

@@ -51,13 +51,26 @@ type ChildProcessTerminationHandle = Pick<
 
 export const makeTerminationError = (
   handle: ChildProcessTerminationHandle,
+  diagnostics?: Effect.Effect<AcpError.AcpProcessDiagnostics | undefined>,
 ): Effect.Effect<AcpError.AcpError> =>
-  Effect.match(handle.exitCode, {
+  Effect.matchEffect(handle.exitCode, {
     onFailure: (cause) =>
-      new AcpError.AcpTransportError({
-        operation: "read-process-exit-status",
-        pid: handle.pid,
-        cause,
-      }),
-    onSuccess: (code) => new AcpError.AcpProcessExitedError({ code, pid: handle.pid }),
+      Effect.succeed(
+        new AcpError.AcpTransportError({
+          operation: "read-process-exit-status",
+          pid: handle.pid,
+          cause,
+        }),
+      ),
+    onSuccess: (code) => {
+      const processExited = (processDiagnostics?: AcpError.AcpProcessDiagnostics) =>
+        new AcpError.AcpProcessExitedError({
+          code,
+          pid: handle.pid,
+          ...(processDiagnostics ? { diagnostics: processDiagnostics } : {}),
+        });
+      return diagnostics
+        ? diagnostics.pipe(Effect.map(processExited))
+        : Effect.succeed(processExited());
+    },
   });

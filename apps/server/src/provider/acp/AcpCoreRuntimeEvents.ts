@@ -153,6 +153,7 @@ export function makeAcpToolCallEvent(input: {
   readonly provider: ProviderDriverKind;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
+  readonly lifecycle?: "started" | "updated" | undefined;
   readonly toolCall: AcpToolCallState;
   readonly rawPayload: unknown;
 }): ProviderRuntimeEvent {
@@ -161,7 +162,9 @@ export function makeAcpToolCallEvent(input: {
     type:
       input.toolCall.status === "completed" || input.toolCall.status === "failed"
         ? "item.completed"
-        : "item.updated",
+        : input.lifecycle === "started"
+          ? "item.started"
+          : "item.updated",
     ...input.stamp,
     provider: input.provider,
     threadId: input.threadId,
@@ -188,6 +191,7 @@ export function makeAcpAssistantItemEvent(input: {
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly itemId: string;
+  readonly itemType?: "assistant_message" | "reasoning";
   readonly lifecycle: "item.started" | "item.completed";
 }): ProviderRuntimeEvent {
   return {
@@ -198,8 +202,33 @@ export function makeAcpAssistantItemEvent(input: {
     turnId: input.turnId,
     itemId: RuntimeItemId.make(input.itemId),
     payload: {
-      itemType: "assistant_message",
+      itemType: input.itemType ?? "assistant_message",
       status: input.lifecycle === "item.completed" ? "completed" : "inProgress",
+    },
+  };
+}
+
+export function makeAcpTurnDiffUpdatedEvent(input: {
+  readonly stamp: AcpEventStamp;
+  readonly provider: ProviderDriverKind;
+  readonly threadId: ThreadId;
+  readonly turnId: TurnId | undefined;
+  readonly itemId: string;
+  readonly unifiedDiff: string;
+  readonly rawPayload: unknown;
+}): ProviderRuntimeEvent {
+  return {
+    type: "turn.diff.updated",
+    ...input.stamp,
+    provider: input.provider,
+    threadId: input.threadId,
+    turnId: input.turnId,
+    itemId: RuntimeItemId.make(input.itemId),
+    payload: { unifiedDiff: input.unifiedDiff },
+    raw: {
+      source: "acp.jsonrpc",
+      method: "session/update",
+      payload: input.rawPayload,
     },
   };
 }
@@ -210,7 +239,12 @@ export function makeAcpContentDeltaEvent(input: {
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly itemId?: string;
-  readonly streamKind?: "assistant_text" | "reasoning_text";
+  readonly streamKind?:
+    | "assistant_text"
+    | "reasoning_text"
+    | "command_output"
+    | "file_change_output"
+    | undefined;
   readonly text: string;
   readonly rawPayload: unknown;
 }): ProviderRuntimeEvent {

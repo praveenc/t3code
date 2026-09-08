@@ -36,6 +36,7 @@ export interface AcpClientOptions {
   ) => AcpSchema.SessionNotification;
   /** Reports input failures and process exits, even between requests. */
   readonly onTermination?: (error: AcpError.AcpError) => Effect.Effect<void, never, never>;
+  readonly processDiagnostics?: Effect.Effect<AcpError.AcpProcessDiagnostics | undefined>;
 }
 
 type AcpClientRaw = {
@@ -593,6 +594,6 @@ export const layerChildProcess = (
     ...makeChildStdio(handle),
     stdin: options.transformStdout?.(handle.stdout) ?? handle.stdout,
   };
-  const terminationError = makeTerminationError(handle);
+  const terminationError = makeTerminationError(handle, options.processDiagnostics);
   return Layer.effect(AcpClient, make(stdio, options, terminationError));
 };
