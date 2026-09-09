@@ -1,6 +1,3 @@
-diff --git a/CHANGELOG.md b/CHANGELOG.md
-deleted file mode 100644
-index a89691bec87b69ae600f4feb67b88b900ab799de..0000000000000000000000000000000000000000
 diff --git a/lib/connection.js b/lib/connection.js
 index 780dc041c58e83ebfcd84434e500ec471020813a..6b5c02dac6e48b344c4a16defdf1709e8145109b 100644
 --- a/lib/connection.js
